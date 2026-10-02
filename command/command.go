@@ -5,9 +5,11 @@
 // Execution starts at any node through (*Node).Execute, which descends one
 // argument at a time, matching only exact, case-sensitive primary names and
 // aliases; aliases resolve to the canonical primary name reported to the
-// handler. The package never generates help text, completions, or log
-// output, and it never writes to the stdout/stderr writers passed to
-// Execute — only node handlers do.
+// handler. Plain-text help is generated on demand through
+// (*Node).WriteHelp; neither Execute nor WriteHelp interprets "--help" or
+// "-h". Apart from the WriteHelp output itself the package never produces
+// help text, completions, or log output, and it never writes to the
+// stdout/stderr writers passed to Execute — only node handlers do.
 package command
 
 import (
