@@ -68,6 +68,42 @@ const (
 	TypeDuration
 )
 
+// Source identifies which layer supplied an option's effective value in a
+// Result, or the layer a parse failure arose from.
+type Source int
+
+const (
+	// SourceNone is returned by Result.Source for an unknown name.
+	SourceNone Source = iota
+	// SourceCommandLine is the command-line arguments layer, the highest
+	// precedence.
+	SourceCommandLine
+	// SourceEnvironment is the environment map layer.
+	SourceEnvironment
+	// SourceConfig is the configuration map layer.
+	SourceConfig
+	// SourceDefault is the option's declared default, the lowest
+	// precedence.
+	SourceDefault
+)
+
+// String renders a Source for diagnostics; unknown values (including
+// SourceNone) render as "none".
+func (s Source) String() string {
+	switch s {
+	case SourceCommandLine:
+		return "command-line"
+	case SourceEnvironment:
+		return "environment"
+	case SourceConfig:
+		return "config"
+	case SourceDefault:
+		return "default"
+	default:
+		return "none"
+	}
+}
+
 // Option declares one command-line option.
 //
 // Long is the option's canonical name used after "--" and as the key for
@@ -80,6 +116,15 @@ const (
 // occurrence; a default never satisfies this. Repeatable allows the option
 // to occur more than once, with every value retained in occurrence order;
 // a non-repeatable option keeps the value of its last occurrence.
+//
+// ConfigKey and EnvVar optionally bind the option to, respectively, a
+// configuration entry and an environment variable consulted by
+// ParseWithSources. Each must either be empty (no binding to that source)
+// or non-empty and unique across every option: assigning the same
+// non-empty ConfigKey or EnvVar to more than one option is an invalid
+// specification rejected by NewParser. An empty binding never matches
+// anything, and configuration keys or environment names matching no
+// declared binding are ignored.
 type Option struct {
 	Long       string
 	Short      string
@@ -87,6 +132,13 @@ type Option struct {
 	Default    string
 	Required   bool
 	Repeatable bool
+	// ConfigKey binds the option to an entry of the configuration map
+	// handed to ParseWithSources; empty means configuration values never
+	// apply to this option.
+	ConfigKey string
+	// EnvVar binds the option to an entry of the environment map handed
+	// to ParseWithSources; empty means environment values never apply.
+	EnvVar string
 }
 
 // Positional declares one named positional argument. When Variadic is true
@@ -132,6 +184,13 @@ type ParseError struct {
 	// Value is the raw value text that failed type conversion, when
 	// applicable.
 	Value string
+	// Source is the layer the failing value came from. It is
+	// SourceCommandLine for failures produced by Parse (and for the
+	// command-line layer of ParseWithSources), and SourceEnvironment or
+	// SourceConfig when a value from that layer failed conversion. It is
+	// SourceNone for failures that carry no value layer (unknown options,
+	// missing values, missing required arguments, unexpected positionals).
+	Source Source
 
 	kind error
 	msg  string
@@ -151,29 +210,36 @@ type compiledPositional struct {
 }
 
 // Parser is an immutable, concurrency-safe compiled specification. A
-// Parser may be shared across goroutines; each Parse call builds an
-// independent Result and touches no process-level state.
+// Parser may be shared across goroutines; each Parse or ParseWithSources
+// call builds an independent Result and touches no process-level state.
 type Parser struct {
 	options []compiledOption
 	args    []compiledPositional
 	long    map[string]*compiledOption
 	short   map[byte]*compiledOption
+	config  map[string]*compiledOption
+	env     map[string]*compiledOption
 }
 
 // NewParser compiles options and positionals into a Parser. Both slices
 // are copied, so later mutations by the caller cannot affect the parser.
 // An invalid specification yields a *SpecError wrapping ErrInvalidSpec and
-// a nil parser.
+// a nil parser. Besides name and default validation, non-empty ConfigKey
+// and EnvVar bindings must each be unique across options.
 func NewParser(options []Option, positionals []Positional) (*Parser, error) {
 	p := &Parser{
 		options: make([]compiledOption, 0, len(options)),
 		args:    make([]compiledPositional, 0, len(positionals)),
 		long:    make(map[string]*compiledOption, len(options)),
 		short:   make(map[byte]*compiledOption, len(options)),
+		config:  make(map[string]*compiledOption, len(options)),
+		env:     make(map[string]*compiledOption, len(options)),
 	}
 
 	seenLong := make(map[string]struct{}, len(options))
 	seenShort := make(map[byte]string, len(options))
+	seenConfig := make(map[string]string, len(options))
+	seenEnv := make(map[string]string, len(options))
 	for i := range options {
 		src := options[i]
 		if !validOptionName(src.Long) {
@@ -192,6 +258,18 @@ func NewParser(options []Option, positionals []Positional) (*Parser, error) {
 					msg: fmt.Sprintf("command: short option %q already used by %q", src.Short, other)}
 			}
 		}
+		if src.ConfigKey != "" {
+			if other, dup := seenConfig[src.ConfigKey]; dup {
+				return nil, &SpecError{Name: src.Long,
+					msg: fmt.Sprintf("command: config key %q already bound to option %q", src.ConfigKey, other)}
+			}
+		}
+		if src.EnvVar != "" {
+			if other, dup := seenEnv[src.EnvVar]; dup {
+				return nil, &SpecError{Name: src.Long,
+					msg: fmt.Sprintf("command: environment variable %q already bound to option %q", src.EnvVar, other)}
+			}
+		}
 		def, err := zeroOrConvert(src.Type, src.Default)
 		if err != nil {
 			return nil, &SpecError{Name: src.Long, Short: src.Short,
@@ -202,12 +280,24 @@ func NewParser(options []Option, positionals []Positional) (*Parser, error) {
 		if src.Short != "" {
 			seenShort[src.Short[0]] = src.Long
 		}
+		if src.ConfigKey != "" {
+			seenConfig[src.ConfigKey] = src.Long
+		}
+		if src.EnvVar != "" {
+			seenEnv[src.EnvVar] = src.Long
+		}
 	}
 	for i := range p.options {
 		co := &p.options[i]
 		p.long[co.Long] = co
 		if co.Short != "" {
 			p.short[co.Short[0]] = co
+		}
+		if co.ConfigKey != "" {
+			p.config[co.ConfigKey] = co
+		}
+		if co.EnvVar != "" {
+			p.env[co.EnvVar] = co
 		}
 	}
 
@@ -329,17 +419,26 @@ func convertValue(t ValueType, raw string) (any, error) {
 }
 
 // Result holds one successful parse. Values are indexed by option long
-// name; a Result is independent of every other Result and of the Parser.
+// name; a Result is independent of every other Result, the Parser, and the
+// caller's source maps.
 type Result struct {
 	parser *Parser
-	// explicit holds the values supplied on the command line in
-	// occurrence order. A non-repeatable option's slice has length at most
-	// one and holds its last occurrence.
-	values map[string][]any
-	pos    []string
+	// cmd holds the values supplied on the command line in occurrence
+	// order. A non-repeatable option's slice has length at most one and
+	// holds its last occurrence. It is the only layer counted by Provided
+	// and Count.
+	cmd map[string][]any
+	// eff holds the effective values after layering: the whole winning
+	// layer, converted per the option's type. Scalar and slice accessors
+	// read these.
+	eff map[string][]any
+	// src records the winning layer of each option, or SourceDefault.
+	src map[string]Source
+	pos []string
 }
 
-// Parse decodes args according to the parser's specification. It never
+// Parse decodes args according to the parser's specification, exactly as
+// ParseWithSources with no configuration or environment layer. It never
 // modifies args: long options accept both "--name=value" and
 // "--name value", non-bool short options accept "-p value" (and the
 // attached "-pvalue"/"-p=value" forms), short boolean options cluster as
@@ -352,7 +451,41 @@ type Result struct {
 // An empty args slice still applies defaults and enforces required
 // options and positionals.
 func (p *Parser) Parse(args []string) (*Result, error) {
-	r := &Result{parser: p, values: make(map[string][]any)}
+	return p.ParseWithSources(args, nil, nil)
+}
+
+// ParseWithSources decodes args together with a configuration layer and
+// an environment layer. None of the arguments are modified, including the
+// maps and the value slices inside config.
+//
+// Effective precedence, consulted as whole layers, is command line, then
+// environment, then configuration, then the option's Default: once a
+// higher layer supplies an option the lower layers never contribute to
+// it, and values are never merged across layers. The configuration map
+// may list several raw values for one key: a non-repeatable option takes
+// the last element and a repeatable option keeps every element; an empty
+// (nil or zero-length) slice means the key was not supplied. The
+// environment layer contributes at most one value per option. A present
+// but empty environment value or configuration element is still an
+// explicit value and is converted according to the option's type (an
+// empty value therefore fails for int and duration options). Config and
+// environment entries matching no declared binding are ignored; the
+// process environment is never read.
+//
+// Required may be satisfied by the command line, environment, or
+// configuration layer, never by a default. A value from the environment
+// or configuration layer that fails conversion returns a *ParseError
+// wrapping ErrInvalidValue with Name set to the canonical long name,
+// Value to the raw value, Source to the originating layer, and an empty
+// Token; no partial Result is returned. Command-line failures keep the
+// *ParseError shape produced by Parse.
+func (p *Parser) ParseWithSources(args []string, config map[string][]string, environ map[string]string) (*Result, error) {
+	r := &Result{
+		parser: p,
+		cmd:    make(map[string][]any),
+		eff:    make(map[string][]any),
+		src:    make(map[string]Source),
+	}
 
 	onlyPositional := false
 	for i := 0; i < len(args); i++ {
@@ -382,6 +515,9 @@ func (p *Parser) Parse(args []string) (*Result, error) {
 		}
 	}
 
+	if err := p.applyLowerLayers(r, config, environ); err != nil {
+		return nil, err
+	}
 	if err := p.checkRequired(r); err != nil {
 		return nil, err
 	}
@@ -404,7 +540,7 @@ func (p *Parser) parseLong(token string, args []string, i *int, r *Result) error
 		}
 		b, err := strconv.ParseBool(raw)
 		if err != nil {
-			return &ParseError{Name: opt.Long, Token: token, Value: raw, kind: ErrInvalidValue,
+			return &ParseError{Name: opt.Long, Token: token, Value: raw, Source: SourceCommandLine, kind: ErrInvalidValue,
 				msg: fmt.Sprintf("command: invalid value %q for option %q: %v", raw, opt.Long, err)}
 		}
 		r.record(opt, b)
@@ -417,7 +553,7 @@ func (p *Parser) parseLong(token string, args []string, i *int, r *Result) error
 	}
 	converted, err := convertValue(opt.Type, value)
 	if err != nil {
-		return &ParseError{Name: opt.Long, Token: token, Value: value, kind: ErrInvalidValue,
+		return &ParseError{Name: opt.Long, Token: token, Value: value, Source: SourceCommandLine, kind: ErrInvalidValue,
 			msg: fmt.Sprintf("command: invalid value %q for option %q: %v", value, opt.Long, err)}
 	}
 	r.record(opt, converted)
@@ -468,7 +604,7 @@ func (p *Parser) parseShort(token string, args []string, i *int, r *Result) erro
 		}
 		converted, err := convertValue(opt.Type, value)
 		if err != nil {
-			return &ParseError{Name: opt.Long, Short: opt.Short, Token: token, Value: value, kind: ErrInvalidValue,
+			return &ParseError{Name: opt.Long, Short: opt.Short, Token: token, Value: value, Source: SourceCommandLine, kind: ErrInvalidValue,
 				msg: fmt.Sprintf("command: invalid value %q for option %q: %v", value, opt.Long, err)}
 		}
 		r.record(opt, converted)
@@ -476,20 +612,75 @@ func (p *Parser) parseShort(token string, args []string, i *int, r *Result) erro
 	return nil
 }
 
-// record stores one explicit occurrence. Non-repeatable options keep only
-// the last occurrence; repeatable options retain all of them in order.
+// record stores one command-line occurrence. Non-repeatable options keep
+// only the last occurrence; repeatable options retain all of them in
+// order.
 func (r *Result) record(opt *compiledOption, value any) {
 	if !opt.Repeatable {
-		r.values[opt.Long] = []any{value}
+		r.cmd[opt.Long] = []any{value}
 		return
 	}
-	r.values[opt.Long] = append(r.values[opt.Long], value)
+	r.cmd[opt.Long] = append(r.cmd[opt.Long], value)
+}
+
+// applyLowerLayers finalizes each option's effective slice and winning
+// source. Command-line occurrences win outright when present; otherwise
+// the environment map, then the configuration map, supplies converted
+// values; an option supplied by none of the three keeps its default.
+// Options are visited in declaration order so a conversion failure is
+// reported deterministically regardless of map iteration.
+func (p *Parser) applyLowerLayers(r *Result, config map[string][]string, environ map[string]string) error {
+	for i := range p.options {
+		opt := &p.options[i]
+		if vs, ok := r.cmd[opt.Long]; ok && len(vs) > 0 {
+			r.eff[opt.Long] = vs
+			r.src[opt.Long] = SourceCommandLine
+			continue
+		}
+		if opt.EnvVar != "" {
+			if raw, present := environ[opt.EnvVar]; present {
+				converted, err := convertValue(opt.Type, raw)
+				if err != nil {
+					return &ParseError{Name: opt.Long, Value: raw, Source: SourceEnvironment, kind: ErrInvalidValue,
+						msg: fmt.Sprintf("command: invalid value %q for option %q from environment: %v", raw, opt.Long, err)}
+				}
+				r.eff[opt.Long] = []any{converted}
+				r.src[opt.Long] = SourceEnvironment
+				continue
+			}
+		}
+		if opt.ConfigKey != "" {
+			if raws, present := config[opt.ConfigKey]; present && len(raws) > 0 {
+				// A non-repeatable option selects only the last element;
+				// a repeatable one keeps every element in order.
+				selected := raws
+				if !opt.Repeatable {
+					selected = raws[len(raws)-1:]
+				}
+				values := make([]any, 0, len(selected))
+				for _, raw := range selected {
+					converted, err := convertValue(opt.Type, raw)
+					if err != nil {
+						return &ParseError{Name: opt.Long, Value: raw, Source: SourceConfig, kind: ErrInvalidValue,
+							msg: fmt.Sprintf("command: invalid value %q for option %q from config: %v", raw, opt.Long, err)}
+					}
+					values = append(values, converted)
+				}
+				r.eff[opt.Long] = values
+				r.src[opt.Long] = SourceConfig
+				continue
+			}
+		}
+		r.eff[opt.Long] = []any{opt.def}
+		r.src[opt.Long] = SourceDefault
+	}
+	return nil
 }
 
 func (p *Parser) checkRequired(r *Result) error {
 	for i := range p.options {
 		opt := &p.options[i]
-		if opt.Required && len(r.values[opt.Long]) == 0 {
+		if opt.Required && len(r.cmd[opt.Long]) == 0 && r.src[opt.Long] != SourceEnvironment && r.src[opt.Long] != SourceConfig {
 			return &ParseError{Name: opt.Long, Short: opt.Short, kind: ErrRequired,
 				msg: fmt.Sprintf("command: missing required option %q", opt.Long)}
 		}
@@ -514,11 +705,10 @@ func (p *Parser) checkRequired(r *Result) error {
 	return nil
 }
 
-// scalar returns the effective single value for an option: the last
-// explicit occurrence, otherwise the parsed default (or the zero value).
-// Unknown names yield nil.
+// scalar returns the effective single value for an option: the last value
+// of the winning layer, or the parsed default. Unknown names yield nil.
 func (r *Result) scalar(name string) any {
-	if vs, ok := r.values[name]; ok && len(vs) > 0 {
+	if vs, ok := r.eff[name]; ok && len(vs) > 0 {
 		return vs[len(vs)-1]
 	}
 	if opt, ok := r.parser.long[name]; ok {
@@ -551,12 +741,26 @@ func (r *Result) Duration(name string) time.Duration {
 	return v
 }
 
-// Strings returns every explicitly provided string value for the named
-// option in occurrence order. Defaults are not included; use String for
-// the effective value.
+// effectiveSlice returns the winning layer's converted values for the
+// slice accessors. A default never contributes, so a default-only option
+// yields an empty slice; the single environment value or the retained
+// configuration elements are returned when those layers win.
+func (r *Result) effectiveSlice(name string) []any {
+	if r.src[name] == SourceDefault {
+		return nil
+	}
+	return r.eff[name]
+}
+
+// Strings returns every effective string value for the named option in
+// layer order: all occurrences from the winning layer (every command-line
+// occurrence, the single environment value, or every retained
+// configuration element), and none from any other layer. A default-only
+// option is not included here; use String for the effective value.
 func (r *Result) Strings(name string) []string {
-	out := make([]string, 0, len(r.values[name]))
-	for _, v := range r.values[name] {
+	vs := r.effectiveSlice(name)
+	out := make([]string, 0, len(vs))
+	for _, v := range vs {
 		if s, ok := v.(string); ok {
 			out = append(out, s)
 		}
@@ -564,11 +768,12 @@ func (r *Result) Strings(name string) []string {
 	return out
 }
 
-// Bools returns every explicitly provided bool value for the named option
-// in occurrence order. Defaults are not included.
+// Bools returns every effective bool value for the named option from the
+// winning layer. A default is not included.
 func (r *Result) Bools(name string) []bool {
-	out := make([]bool, 0, len(r.values[name]))
-	for _, v := range r.values[name] {
+	vs := r.effectiveSlice(name)
+	out := make([]bool, 0, len(vs))
+	for _, v := range vs {
 		if b, ok := v.(bool); ok {
 			out = append(out, b)
 		}
@@ -576,11 +781,12 @@ func (r *Result) Bools(name string) []bool {
 	return out
 }
 
-// Ints returns every explicitly provided int value for the named option in
-// occurrence order. Defaults are not included.
+// Ints returns every effective int value for the named option from the
+// winning layer. A default is not included.
 func (r *Result) Ints(name string) []int {
-	out := make([]int, 0, len(r.values[name]))
-	for _, v := range r.values[name] {
+	vs := r.effectiveSlice(name)
+	out := make([]int, 0, len(vs))
+	for _, v := range vs {
 		if n, ok := v.(int); ok {
 			out = append(out, n)
 		}
@@ -588,11 +794,12 @@ func (r *Result) Ints(name string) []int {
 	return out
 }
 
-// Durations returns every explicitly provided duration value for the named
-// option in occurrence order. Defaults are not included.
+// Durations returns every effective duration value for the named option
+// from the winning layer. A default is not included.
 func (r *Result) Durations(name string) []time.Duration {
-	out := make([]time.Duration, 0, len(r.values[name]))
-	for _, v := range r.values[name] {
+	vs := r.effectiveSlice(name)
+	out := make([]time.Duration, 0, len(vs))
+	for _, v := range vs {
 		if d, ok := v.(time.Duration); ok {
 			out = append(out, d)
 		}
@@ -600,17 +807,29 @@ func (r *Result) Durations(name string) []time.Duration {
 	return out
 }
 
-// Provided reports whether the named option occurred explicitly on the
-// command line. A value coming from a default reports false.
-func (r *Result) Provided(name string) bool {
-	return len(r.values[name]) > 0
+// Source reports the whole layer that supplied the effective value of the
+// named option: SourceCommandLine, SourceEnvironment, SourceConfig, or
+// SourceDefault. An unknown name returns SourceNone.
+func (r *Result) Source(name string) Source {
+	if s, ok := r.src[name]; ok {
+		return s
+	}
+	return SourceNone
 }
 
-// Count returns the number of explicit occurrences of the named option. A
-// non-repeatable option provided at least once reports 1; a default-only
-// option reports 0.
+// Provided reports whether the named option occurred explicitly on the
+// command line. Values supplied by the environment or configuration layer
+// and values coming from a default all report false.
+func (r *Result) Provided(name string) bool {
+	return len(r.cmd[name]) > 0
+}
+
+// Count returns the number of explicit command-line occurrences of the
+// named option. A non-repeatable option provided at least once reports 1;
+// an option supplied only by the environment, configuration, or a default
+// reports 0.
 func (r *Result) Count(name string) int {
-	return len(r.values[name])
+	return len(r.cmd[name])
 }
 
 // Args returns a copy of all positional tokens in command-line order,
