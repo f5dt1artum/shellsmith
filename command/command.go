@@ -7,9 +7,11 @@
 // aliases; aliases resolve to the canonical primary name reported to the
 // handler. Plain-text help is generated on demand through
 // (*Node).WriteHelp; neither Execute nor WriteHelp interprets "--help" or
-// "-h". Apart from the WriteHelp output itself the package never produces
-// help text, completions, or log output, and it never writes to the
-// stdout/stderr writers passed to Execute — only node handlers do.
+// "-h". Shell completion scripts for bash, zsh, fish, and powershell are
+// generated on demand through (*Node).WriteCompletion. Apart from the
+// WriteHelp and WriteCompletion outputs themselves the package never
+// produces help text, completions, or log output, and it never writes to
+// the stdout/stderr writers passed to Execute — only node handlers do.
 package command
 
 import (
