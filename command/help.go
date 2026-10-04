@@ -33,8 +33,9 @@ import (
 // primary name, aliases in registration order, and the description. Options
 // appear in an "Options:" section in declaration order with their short and
 // long names, a "<string>", "<int>" or "<duration>" placeholder for
-// non-boolean options, and "(required)", "(repeatable)" and
-// "(default: value)" markers as applicable. Sections are separated by
+// non-boolean options, and "(required)", "(repeatable)", "(sensitive)"
+// and "(default: value)" markers as applicable; a sensitive option is
+// marked "(sensitive)" and never shows its default. Sections are separated by
 // exactly one blank line, every line ends with LF, the text ends with a
 // single LF, and no ANSI sequences are emitted.
 //
@@ -150,7 +151,11 @@ func appendOptions(b *strings.Builder, parser *Parser) {
 		if opt.Repeatable {
 			markers = append(markers, "repeatable")
 		}
-		if opt.Default != "" {
+		// A sensitive option never reveals its default, even a non-empty
+		// one: the marker itself would leak a credential.
+		if opt.Sensitive {
+			markers = append(markers, "sensitive")
+		} else if opt.Default != "" {
 			markers = append(markers, "default: "+opt.Default)
 		}
 		if len(markers) > 0 {

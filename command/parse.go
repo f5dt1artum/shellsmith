@@ -104,6 +104,19 @@ const (
 // to occur more than once, with every value retained in occurrence order;
 // a non-repeatable option keeps the value of its last occurrence.
 //
+// Sensitive marks an option whose values are credentials (passwords,
+// tokens, keys) and must never be echoed by the package. It changes
+// neither type conversion nor Required, Repeatable, source precedence,
+// the Result's raw value accessors, Provided, Count, or error
+// classification: a successful parse still yields the original value, and
+// conversion of a sensitive value fails in exactly the same cases.
+// Sensitive only constrains what the package itself exposes: WriteHelp
+// shows a "sensitive" marker and never shows the option's Default; a
+// failed conversion leaves the ParseError text, Value and any
+// value-embedding Token carrying "<redacted>" rather than the raw value;
+// and (*Parser).RedactArgs produces a logging-safe copy of an argument
+// vector with sensitive values replaced.
+//
 // ConfigKey optionally binds the option to an entry of the config map
 // passed to ParseWithSources; EnvVar optionally binds it to an entry of
 // the environ map. Either empty means the option does not participate in
@@ -119,6 +132,7 @@ type Option struct {
 	EnvVar     string
 	Required   bool
 	Repeatable bool
+	Sensitive  bool
 }
 
 // Positional declares one named positional argument. When Variadic is true
@@ -159,10 +173,15 @@ type ParseError struct {
 	Short string
 	// Token is the raw command-line token involved: the unknown option
 	// token, the option token left without a value, or the surplus
-	// positional token.
+	// positional token. When a value-taking option declared Sensitive
+	// fails conversion with an attached value ("--opt=value" or a short
+	// cluster such as "-pvalue"), Token carries the option spelling with
+	// the attached value replaced by "<redacted>"; a separate value token
+	// (and every non-sensitive token) is carried verbatim.
 	Token string
 	// Value is the raw value text that failed type conversion, when
-	// applicable.
+	// applicable. For an option declared Sensitive it is "<redacted>"
+	// instead of the raw value.
 	Value string
 	// Source identifies the layer a value-conversion failure came from:
 	// SourceEnvironment or SourceConfig for ParseWithSources, or
@@ -395,6 +414,71 @@ func convertValue(t ValueType, raw string) (any, error) {
 	}
 }
 
+// invalidValueParseError builds the *ParseError for a value that failed
+// type conversion. layer is "" for a command-line value, "environment" or
+// "config" for the other layers; token carries the command-line token
+// (already masked by the caller when it embeds the value) and is empty for
+// environment or config failures; short carries the short spelling for a
+// short-cluster failure.
+//
+// For a sensitive option the raw value is replaced with redactedMarker in
+// every field, and the text of convErr is omitted entirely: the standard
+// library's conversion errors quote the offending input, so appending it
+// would leak the credential. Classification (ErrInvalidValue and Source),
+// Name and Short are unaffected.
+func invalidValueParseError(opt *compiledOption, raw, token, short string, source Source, layer string, convErr error) *ParseError {
+	shown := raw
+	if opt.Sensitive {
+		shown = redactedMarker
+	}
+	var msg string
+	switch layer {
+	case "environment":
+		msg = fmt.Sprintf("command: invalid environment value %q for %s %q", shown, opt.EnvVar, opt.Long)
+	case "config":
+		msg = fmt.Sprintf("command: invalid config value %q for %s %q", shown, opt.ConfigKey, opt.Long)
+	default:
+		msg = fmt.Sprintf("command: invalid value %q for option %q", shown, opt.Long)
+	}
+	if !opt.Sensitive {
+		msg += ": " + convErr.Error()
+	}
+	return &ParseError{
+		Name:   opt.Long,
+		Short:  short,
+		Token:  token,
+		Value:  shown,
+		Source: source,
+		kind:   ErrInvalidValue,
+		msg:    msg,
+	}
+}
+
+// maskedLongToken masks the "=" value embedded in a long option token for
+// a sensitive option. A token spelling without an attached value never
+// embeds one and is returned unchanged.
+func maskedLongToken(opt *compiledOption, name, token string, hasValue bool) string {
+	if opt.Sensitive && hasValue {
+		return "--" + name + "=" + redactedMarker
+	}
+	return token
+}
+
+// maskedShortToken masks a value attached to a value-taking option at
+// position j in a short cluster for a sensitive option (e.g. "-vtsecret"
+// or "-vt=secret" becomes "-vt<redacted>"). A value supplied as the next
+// token is not embedded and the cluster spelling is returned unchanged.
+func maskedShortToken(opt *compiledOption, token string, j int, attached bool) string {
+	if !opt.Sensitive || !attached {
+		return token
+	}
+	prefix := token[:j+1]
+	if token[j+1] == '=' {
+		prefix = token[:j+2]
+	}
+	return prefix + redactedMarker
+}
+
 // Result holds one successful parse. Values are indexed by option long
 // name; a Result is independent of every other Result and of the Parser.
 type Result struct {
@@ -541,8 +625,7 @@ func (p *Parser) applyEnviron(r *Result, environ map[string]string) error {
 		}
 		converted, err := convertValue(opt.Type, raw)
 		if err != nil {
-			return &ParseError{Name: opt.Long, Value: raw, Source: SourceEnvironment, kind: ErrInvalidValue,
-				msg: fmt.Sprintf("command: invalid environment value %q for %s %q: %v", raw, opt.EnvVar, opt.Long, err)}
+			return invalidValueParseError(opt, raw, "", "", SourceEnvironment, "environment", err)
 		}
 		layer.record(opt, converted)
 	}
@@ -578,8 +661,7 @@ func (p *Parser) applyConfig(r *Result, config map[string][]string) error {
 			raw := raws[len(raws)-1]
 			converted, err := convertValue(opt.Type, raw)
 			if err != nil {
-				return &ParseError{Name: opt.Long, Value: raw, Source: SourceConfig, kind: ErrInvalidValue,
-					msg: fmt.Sprintf("command: invalid config value %q for %s %q: %v", raw, opt.ConfigKey, opt.Long, err)}
+				return invalidValueParseError(opt, raw, "", "", SourceConfig, "config", err)
 			}
 			layer.record(opt, converted)
 			continue
@@ -587,8 +669,7 @@ func (p *Parser) applyConfig(r *Result, config map[string][]string) error {
 		for _, raw := range raws {
 			converted, err := convertValue(opt.Type, raw)
 			if err != nil {
-				return &ParseError{Name: opt.Long, Value: raw, Source: SourceConfig, kind: ErrInvalidValue,
-					msg: fmt.Sprintf("command: invalid config value %q for %s %q: %v", raw, opt.ConfigKey, opt.Long, err)}
+				return invalidValueParseError(opt, raw, "", "", SourceConfig, "config", err)
 			}
 			layer.record(opt, converted)
 		}
@@ -613,8 +694,7 @@ func (p *Parser) parseLong(token string, args []string, i *int, r *Result) error
 		}
 		b, err := strconv.ParseBool(raw)
 		if err != nil {
-			return &ParseError{Name: opt.Long, Token: token, Value: raw, kind: ErrInvalidValue,
-				msg: fmt.Sprintf("command: invalid value %q for option %q: %v", raw, opt.Long, err)}
+			return invalidValueParseError(opt, raw, maskedLongToken(opt, name, token, true), "", SourceNone, "", err)
 		}
 		r.record(opt, b)
 		return nil
@@ -626,8 +706,7 @@ func (p *Parser) parseLong(token string, args []string, i *int, r *Result) error
 	}
 	converted, err := convertValue(opt.Type, value)
 	if err != nil {
-		return &ParseError{Name: opt.Long, Token: token, Value: value, kind: ErrInvalidValue,
-			msg: fmt.Sprintf("command: invalid value %q for option %q: %v", value, opt.Long, err)}
+		return invalidValueParseError(opt, value, maskedLongToken(opt, name, token, hasValue), "", SourceNone, "", err)
 	}
 	r.record(opt, converted)
 	return nil
@@ -661,11 +740,14 @@ func (p *Parser) parseShort(token string, args []string, i *int, r *Result) erro
 		}
 
 		var value string
+		attached := false
+		charAt := j
 		if j+1 < len(token) {
 			// Attached value: -pvalue or -p=value; the remainder of the
 			// cluster belongs to this option regardless of content.
 			value = token[j+1:]
 			value = strings.TrimPrefix(value, "=")
+			attached = true
 			j = len(token)
 		} else {
 			if *i+1 >= len(args) {
@@ -677,8 +759,7 @@ func (p *Parser) parseShort(token string, args []string, i *int, r *Result) erro
 		}
 		converted, err := convertValue(opt.Type, value)
 		if err != nil {
-			return &ParseError{Name: opt.Long, Short: opt.Short, Token: token, Value: value, kind: ErrInvalidValue,
-				msg: fmt.Sprintf("command: invalid value %q for option %q: %v", value, opt.Long, err)}
+			return invalidValueParseError(opt, value, maskedShortToken(opt, token, charAt, attached), opt.Short, SourceNone, "", err)
 		}
 		r.record(opt, converted)
 	}
